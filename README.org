@@ -1,0 +1,128 @@
+* ccc — Claude Code Continue
+
+A single-file, zero-dependency Go reverse proxy that sits between Claude
+Code and api.anthropic.com, pooling multiple Claude Pro accounts. All
+requests go to one account until it returns a 429, then it switches to
+the next and retries. When all accounts are exhausted it returns 429 to
+Claude Code.
+
+** How it works
+
+#+begin_example
+Claude Code  ──▶  ccc (127.0.0.1:7999)  ──▶  api.anthropic.com
+                  │
+                  │  account-a  ← active until 429
+                  │  account-b  ← standby
+#+end_example
+
+- All requests go to account-a until it returns a 429.
+- On 429: account-a is skipped (see below), the request is retried on account-b.
+- If account-b also returns 429, a 429 is returned to Claude Code.
+- All headers are forwarded unchanged. Only the =Authorization= / =X-Api-Key=
+  headers are replaced with the active account's bearer token.
+- SSE streaming is flushed chunk-by-chunk so tokens appear in real time.
+
+** What happens on 429
+
+When a 429 is received, the account is skipped and the request is retried on
+the next account. The skip duration depends on the =Retry-After= header:
+
+- *Retry-After header present* (short-term rate limit): skipped for exactly
+  that many seconds (supports both =delay-seconds= and =HTTP-date= formats).
+  The account re-enters the pool automatically.
+- *No Retry-After header* (usage exhausted for the period): skipped for 10 min.
+
+When all accounts are skipped, the proxy returns =429= to the client with a
+=Retry-After= header set to the time until the soonest account un-expires,
+so the client knows when to come back. All non-429 responses (success,
+errors, etc.) are passed through to the client unchanged.
+
+** Install
+
+#+begin_src sh
+git clone https://github.com/helinwang/ccc
+cd ccc
+go build -o ccc .          # requires Go 1.22+, no external dependencies
+#+end_src
+
+** Getting your tokens from Claude Code
+
+Claude Code stores OAuth credentials in the macOS Keychain or on disk.
+You need the *access token* and *refresh token* for each account.
+
+*** macOS
+
+#+begin_src sh
+security find-generic-password -s "Claude Code-credentials" -w \
+  | python3 -c "
+import json, sys
+d = json.load(sys.stdin)['claudeAiOauth']
+print(d['accessToken'] + ',' + d['refreshToken'])
+"
+#+end_src
+
+*** Linux
+
+Credentials are at =~/.claude/.credentials.json=:
+
+#+begin_src sh
+python3 -c "
+import json
+d = json.load(open('$HOME/.claude/.credentials.json'))['claudeAiOauth']
+print(d['accessToken'] + ',' + d['refreshToken'])
+"
+#+end_src
+
+** Token file format
+
+Each line in =tokens.txt= is comma-separated:
+
+#+begin_example
+access_token,refresh_token
+#+end_example
+
+If a refresh token is present, ccc refreshes all tokens at startup and
+automatically refreshes them before they expire. The file is rewritten
+with updated access tokens and expiry times after each refresh:
+
+#+begin_example
+access_token,refresh_token,2026-04-07T20:00:00Z
+#+end_example
+
+Lines without a comma are treated as plain access tokens (no refresh).
+
+** Setup
+
+1. Put one entry per line in =tokens.txt=:
+
+#+begin_example
+sk-ant-oat01-AAAA...,sk-ant-ort01-AAAA...
+sk-ant-oat01-BBBB...,sk-ant-ort01-BBBB...
+#+end_example
+
+2. Run the proxy:
+
+#+begin_src sh
+./ccc -tokens tokens.txt -listen 127.0.0.1:7999
+# ccc listening on 127.0.0.1:7999 → https://api.anthropic.com (2 accounts)
+#+end_src
+
+Both flags are optional (defaults shown above).
+
+3. Point Claude Code at it:
+
+#+begin_src sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:7999
+claude
+#+end_src
+
+Add the export to your shell profile (~/.zshrc, ~/.bashrc) to make it permanent.
+
+** File layout
+
+#+begin_example
+ccc/
+├── main.go      everything — proxy, pool, token loading
+├── go.mod       module declaration only, no external dependencies
+└── tokens.txt   one entry per line: access_token[,refresh_token[,expires_at]]
+#+end_example
