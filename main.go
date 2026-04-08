@@ -119,6 +119,14 @@ type pool struct {
 	mu       sync.Mutex
 	accounts []*account
 	current  int
+
+	// lastErrMu guards the most recent upstream 429 we have seen. We replay
+	// it (with an overridden Retry-After) when the client hits the
+	// "all accounts skipped" state, so the client receives a real
+	// Anthropic-shaped error body instead of a synthesized one.
+	lastErrMu      sync.Mutex
+	lastErrHeaders http.Header
+	lastErrBody    []byte
 }
 
 type tokenEntry struct {
@@ -190,6 +198,33 @@ func (p *pool) skip(a *account, retryAfter string) {
 	}
 }
 
+// resetHeadersToRewrite are absolute Unix-second timestamps that need to be
+// overridden on each replay to match the pool-wide soonest resume time
+// instead of the failing account's.
+var resetHeadersToRewrite = []string{
+	"Anthropic-Ratelimit-Unified-Reset",
+}
+
+// recordLastError caches the headers and body of the most recent upstream 429
+// so the proxy can replay them to clients when the whole pool is skipped.
+func (p *pool) recordLastError(headers http.Header, body []byte) {
+	p.lastErrMu.Lock()
+	defer p.lastErrMu.Unlock()
+	p.lastErrHeaders = headers.Clone()
+	p.lastErrBody = append([]byte(nil), body...)
+}
+
+// snapshotLastError returns a copy of the cached 429 response. nil headers
+// means no 429 has been seen yet in this process.
+func (p *pool) snapshotLastError() (http.Header, []byte) {
+	p.lastErrMu.Lock()
+	defer p.lastErrMu.Unlock()
+	if p.lastErrHeaders == nil {
+		return nil, nil
+	}
+	return p.lastErrHeaders.Clone(), append([]byte(nil), p.lastErrBody...)
+}
+
 // snapshot returns a shallow copy of the accounts slice for iteration outside the lock.
 func (p *pool) snapshot() []*account {
 	p.mu.Lock()
@@ -245,24 +280,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				time.Sleep(10 * time.Millisecond)
 				continue
 			}
-			// Return 429 with retry timing so the client knows when to come back.
-			retrySecs := int(wait.Truncate(time.Second).Seconds())
-			if retrySecs < 1 {
-				retrySecs = 1
-			}
-			logWarn("all accounts skipped, retry-after %ds (%s %s, %s)",
-				retrySecs, r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
-			w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusTooManyRequests)
-			errBody, _ := json.Marshal(map[string]any{
-				"type": "error",
-				"error": map[string]any{
-					"type":    "rate_limit_error",
-					"message": fmt.Sprintf("Rate limited. Retry after %d seconds.", retrySecs),
-				},
-			})
-			w.Write(errBody) //nolint:errcheck
+			p.respondAllSkipped(w, r, start, wait)
 			return
 		}
 		resp, err := p.forward(r, acct, body)
@@ -300,14 +318,19 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				if copyErr != nil {
 					logWarn("error copying response body to client: %v", copyErr)
 				}
-				decoded, tag := decodeBytes(capture.buf.Bytes(), resp.Header.Get("Content-Encoding"))
+				enc := resp.Header.Get("Content-Encoding")
+				decoded, ok := decodeBytes(capture.buf.Bytes(), enc)
 				if len(decoded) > maxLogBytes {
 					decoded = decoded[:maxLogBytes]
+				}
+				bodyTag := "plain"
+				if !ok {
+					bodyTag = "encoded:" + enc
 				}
 				logWarn("%s %s → %d (%s) headers=[%s] body(%s)=%s",
 					r.Method, r.URL.Path, resp.StatusCode,
 					time.Since(start).Round(time.Millisecond),
-					formatHeaders(resp.Header), tag, decoded)
+					formatHeaders(resp.Header), bodyTag, decoded)
 			} else {
 				logInfo("%s %s → %d (%s)", r.Method, r.URL.Path, resp.StatusCode, time.Since(start).Round(time.Millisecond))
 				writeResponse(w, resp)
@@ -315,21 +338,78 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		// 429 — body is not forwarded to client; read up to maxLogBytes and decode for log.
+		// 429 — body is not forwarded to client. Read the body verbatim (capped
+		// at maxErrBodyBytes as a safety bound) and cache it as-is for replay
+		// when the whole pool is skipped. No decoding, no body logging.
 		retryAfter := resp.Header.Get("Retry-After")
-		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxLogBytes))
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrBodyBytes))
 		resp.Body.Close()
-		decoded, tag := decodeBytes(raw, resp.Header.Get("Content-Encoding"))
-		if len(decoded) > maxLogBytes {
-			decoded = decoded[:maxLogBytes]
-		}
-		logWarn("429 from upstream (account %s) retry-after=%q headers=[%s] body(%s)=%s",
-			tokenTag(acct.getToken()), retryAfter, formatHeaders(resp.Header), tag, decoded)
+		p.pool.recordLastError(resp.Header, raw)
+		logWarn("429 from upstream (account %s) retry-after=%q headers=[%s]",
+			tokenTag(acct.getToken()), retryAfter, formatHeaders(resp.Header))
 		p.pool.skip(acct, retryAfter)
 	}
-	// Exhausted all attempts (each account 429'd in this single request).
+	// Loop bound exhausted (safety net — normally the next iteration's pick()
+	// returns nil and respondAllSkipped handles it). Reach here only on a
+	// race where accounts un-skip mid-loop. Replay the cached 429 the same
+	// way the pick()==nil branch does.
 	logError("retry budget exhausted (%d attempts) for %s %s", maxAttempts, r.Method, r.URL.Path)
-	http.Error(w, "all accounts rate-limited", http.StatusTooManyRequests)
+	wait := time.Until(p.pool.soonest())
+	if wait < time.Second {
+		wait = time.Second
+	}
+	p.respondAllSkipped(w, r, start, wait)
+}
+
+// respondAllSkipped writes a 429 to the client when no account is available.
+// It replays the most recent upstream 429 response (headers + body) so the
+// client sees a real Anthropic error shape, but overrides Retry-After with
+// the soonest pool-wide resume time. If no upstream 429 has been observed
+// yet (e.g. fresh process, accounts skipped via some other path), it falls
+// back to a synthesized minimal Anthropic-shaped error.
+func (p *proxy) respondAllSkipped(w http.ResponseWriter, r *http.Request, start time.Time, wait time.Duration) {
+	retrySecs := int(wait.Truncate(time.Second).Seconds())
+	if retrySecs < 1 {
+		retrySecs = 1
+	}
+	logWarn("all accounts skipped, retry-after %ds (%s %s, %s)",
+		retrySecs, r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
+
+	headers, body := p.pool.snapshotLastError()
+	if headers == nil {
+		// No cached upstream 429 — synthesize a minimal Anthropic-shaped error.
+		w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		errBody, _ := json.Marshal(map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    "rate_limit_error",
+				"message": fmt.Sprintf("Rate limited. Retry after %d seconds.", retrySecs),
+			},
+		})
+		w.Write(errBody) //nolint:errcheck
+		return
+	}
+
+	// Replay cached upstream headers, minus hop-by-hop, with overridden
+	// Retry-After and rewritten absolute reset timestamps so the time-based
+	// fields match the pool's actual recovery moment instead of one account's.
+	for k, v := range headers {
+		w.Header()[k] = v
+	}
+	for _, h := range hopHeaders {
+		w.Header().Del(h)
+	}
+	w.Header().Set("Retry-After", strconv.Itoa(retrySecs))
+	resetUnix := strconv.FormatInt(time.Now().Add(wait).Unix(), 10)
+	for _, h := range resetHeadersToRewrite {
+		if w.Header().Get(h) != "" {
+			w.Header().Set(h, resetUnix)
+		}
+	}
+	w.WriteHeader(http.StatusTooManyRequests)
+	w.Write(body) //nolint:errcheck
 }
 
 func (p *proxy) forward(r *http.Request, acct *account, body []byte) (*http.Response, error) {
@@ -394,31 +474,34 @@ func writeResponse(w http.ResponseWriter, resp *http.Response) {
 // maxLogBytes caps how many body bytes we capture for any single log line.
 const maxLogBytes = 4096
 
+// maxErrBodyBytes caps how much of an upstream 429 body we read into memory
+// for caching/replay. 429 error JSON is small; this is a safety bound.
+const maxErrBodyBytes = 64 * 1024
+
 // decodeBytes decompresses raw according to Content-Encoding for logging
-// purposes. Returns the decoded bytes (or raw on failure) plus a tag
-// describing what happened so the caller can put it in a log line.
-func decodeBytes(raw []byte, contentEncoding string) ([]byte, string) {
+// purposes. Returns the decoded bytes (or raw on failure) and a bool that
+// is true when the returned bytes are plaintext.
+func decodeBytes(raw []byte, contentEncoding string) ([]byte, bool) {
 	enc := strings.ToLower(strings.TrimSpace(contentEncoding))
 	switch enc {
 	case "", "identity":
-		return raw, "identity"
+		return raw, true
 	case "gzip":
 		gr, err := gzip.NewReader(bytes.NewReader(raw))
 		if err != nil {
-			return raw, fmt.Sprintf("gzip-open-error:%v", err)
+			return raw, false
 		}
 		defer gr.Close()
 		out, err := io.ReadAll(gr)
 		if err != nil && len(out) == 0 {
-			return raw, fmt.Sprintf("gzip-read-error:%v", err)
+			return raw, false
 		}
 		// Partial reads (truncated capture) may return err with some data —
 		// keep what we got.
-		return out, "gzip"
+		return out, true
 	default:
-		// br / zstd / deflate — no stdlib decoder we want to pull in. Log the
-		// fact so the operator knows why the bytes look like garbage.
-		return raw, "encoding=" + enc + " (not decoded)"
+		// br / zstd / deflate — no stdlib decoder we want to pull in.
+		return raw, false
 	}
 }
 
