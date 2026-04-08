@@ -1,10 +1,19 @@
 * ccc — Claude Code Continue
 
-A single-file, zero-dependency Go reverse proxy that sits between Claude
-Code and api.anthropic.com, pooling multiple Claude Pro accounts. All
-requests go to one account until it returns a 429, then it switches to
-the next and retries. When all accounts are exhausted it returns 429 to
-Claude Code.
+** The problem
+
+Claude Code on the Pro/Max plan has usage limits. When you hit the
+limit, Claude Code stops working until the limit resets — which can
+be minutes or longer. (Technically, the API returns HTTP 429 "Too
+Many Requests".)
+
+** The solution
+
+ccc pools multiple Claude accounts behind a local proxy. When one
+account hits its limit, ccc automatically switches to the next one
+and retries — so you can keep working uninterrupted.
+
+It is a single-file, zero-dependency Go program.
 
 ** How it works
 
