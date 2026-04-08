@@ -13,6 +13,11 @@ ccc pools multiple Claude accounts behind a local proxy. When one
 account hits its limit, ccc automatically switches to the next one
 and retries — so you can keep working uninterrupted.
 
+It also auto-refreshes OAuth tokens before they expire, so you never
+have to manually run =/login= when a token goes stale. On macOS,
+this avoids the extra annoyance of refreshing the Keychain when
+connecting remotely (e.g. via SSH).
+
 It is a single-file, zero-dependency Go program.
 
 ** How it works
@@ -90,19 +95,22 @@ Each line in =tokens.txt= is comma-separated:
 access_token,refresh_token
 #+end_example
 
-If a refresh token is present, ccc refreshes all tokens at startup and
-automatically refreshes them before they expire. The file is rewritten
-with updated access tokens and expiry times after each refresh:
+You only need to provide the access token and refresh token — *do not*
+add the timestamp column yourself. If a refresh token is present, ccc
+refreshes all tokens at startup and automatically refreshes them before
+they expire. It rewrites the file with updated access tokens and expiry
+timestamps:
 
 #+begin_example
-access_token,refresh_token,2026-04-07T20:00:00Z
+access_token,refresh_token,2026-04-07T20:00:00Z   ← written by ccc
 #+end_example
 
 Lines without a comma are treated as plain access tokens (no refresh).
 
 ** Setup
 
-1. Put one entry per line in =tokens.txt=:
+1. Get your tokens (see above) and put one entry per line in =tokens.txt=
+   — just the access token and refresh token, comma-separated:
 
 #+begin_example
 sk-ant-oat01-AAAA...,sk-ant-ort01-AAAA...
