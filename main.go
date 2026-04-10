@@ -343,8 +343,6 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrBodyBytes))
 		resp.Body.Close()
 		p.pool.recordLastError(resp.Header, raw)
-		logWarn("429 from upstream (account %s) retry-after=%q headers=[%s]",
-			tokenTag(acct.getToken()), retryAfter, formatHeaders(resp.Header))
 		p.pool.skip(acct, retryAfter)
 	}
 	// Loop bound exhausted (safety net — normally the next iteration's pick()
