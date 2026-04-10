@@ -25,13 +25,18 @@ It is a single-file, zero-dependency Go program.
 #+begin_example
 Claude Code  ──▶  ccc (127.0.0.1:7999)  ──▶  api.anthropic.com
                   │
-                  │  account-a  ← active until 429
-                  │  account-b  ← standby
+                  │  account-1  ← always preferred (drain first)
+                  │  account-2  ← used only when 1 is rate-limited
+                  │  account-3  ← used only when 1 and 2 are rate-limited
+                  │  …          ← any number of accounts
 #+end_example
 
-- All requests go to account-a until it returns a 429.
-- On 429: account-a is skipped (see below), the request is retried on account-b.
-- If account-b also returns 429, a 429 is returned to Claude Code.
+- Account 1 is used exclusively until it returns a 429.
+- On 429: account 1 is skipped and the request is retried on account 2,
+  then 3, and so on — earlier accounts are always preferred.
+- When account 1's rate limit expires, all traffic immediately moves back to
+  it, even if a later account is still available.
+- If all accounts are rate-limited, a 429 is returned to Claude Code.
 - All headers are forwarded unchanged. Only the =Authorization= / =X-Api-Key=
   headers are replaced with the active account's bearer token.
 - SSE streaming is flushed chunk-by-chunk so tokens appear in real time.

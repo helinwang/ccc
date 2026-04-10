@@ -114,11 +114,10 @@ func (a *account) update(token, refreshToken string, expiresAt time.Time) {
 	a.expiresAt = expiresAt
 }
 
-// pool manages accounts with fill-first selection.
+// pool manages accounts with drain-first selection (lowest index preferred).
 type pool struct {
 	mu       sync.Mutex
 	accounts []*account
-	current  int
 
 	// lastErrMu guards the most recent upstream 429 we have seen. We replay
 	// it (with an overridden Retry-After) when the client hits the
@@ -160,21 +159,21 @@ func (p *pool) soonest() time.Time {
 	return earliest
 }
 
-// pick returns the first non-skipped account, or nil if all are skipped.
+// pick returns the lowest-index non-skipped account, or nil if all are
+// skipped. Earlier accounts are always preferred so that one account is
+// exhausted before the next is touched, and traffic returns to an earlier
+// account as soon as its rate-limit window expires.
 func (p *pool) pick() *account {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
 	n := len(p.accounts)
-	for i := 0; i < n; i++ {
-		idx := (p.current + i) % n
-		a := p.accounts[idx]
+	for i, a := range p.accounts {
 		if now.After(a.skipUntil) {
-			p.current = idx
-			logDebug("picked account %d/%d (%s)", idx+1, n, tokenTag(a.getToken()))
+			logDebug("picked account %d/%d (%s)", i+1, n, tokenTag(a.getToken()))
 			return a
 		}
-		logDebug("account %d/%d skipped (resumes %s)", idx+1, n, a.skipUntil.Format(time.RFC3339))
+		logDebug("account %d/%d skipped (resumes %s)", i+1, n, a.skipUntil.Format(time.RFC3339))
 	}
 	return nil
 }
@@ -192,7 +191,6 @@ func (p *pool) skip(a *account, retryAfter string) {
 		if acc == a {
 			logWarn("account %d/%d (%s) 429'd, skip until %s (retry-after: %q)",
 				i+1, len(p.accounts), tokenTag(a.getToken()), resume.Format(time.RFC3339), retryAfter)
-			p.current = (i + 1) % len(p.accounts)
 			return
 		}
 	}
